@@ -10,27 +10,35 @@ from types import SimpleNamespace
 from gordian.colors import chosen_color, normalize_hex
 from gordian.classify import Memory, classify, resolve, segment_identity
 from gordian.chart import (
+    CumulativeChart,
     _tick_step,
     application_totals,
     away_spans,
     axis_label,
+    balance_color,
+    balance_points,
+    blend_hex,
+    hover_time_label,
     clamp_range,
     cumulative_points,
     covered_range,
     data_bounds,
     format_axis_duration,
     pan_range,
+    pause_spans,
     value_at,
     y_ticks,
     zoom_range,
 )
 from gordian.formatting import format_duration, format_ratio, parse_day, parse_ratio
+from gordian.resources import ProcessLoad, format_load
 from gordian.ledger import (
     AWAY_SECONDS,
     Ledger,
     clear_saved_history,
     forget_saved_segments,
     read_saved_segments,
+    _segments_from_day,
     wall_gap_kind,
 )
 from gordian.address import capitalise_name, website_name
@@ -102,6 +110,20 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(format_duration(65), "1m 05s")
         self.assertEqual(format_duration(3661), "1h 01m 01s")
         self.assertEqual(format_duration(-5), "-0m 05s")
+
+
+class ResourceTests(unittest.TestCase):
+    def test_format_load_and_sample(self) -> None:
+        self.assertEqual(format_load(1.0, 0.4), "CPU: 1.0%   RAM: 0.4%")
+        load = ProcessLoad()
+        first = load.sample()
+        self.assertEqual(len(first), 2)
+        self.assertGreaterEqual(first[0], 0.0)
+        self.assertLessEqual(first[0], 100.0)
+        self.assertGreaterEqual(first[1], 0.0)
+        self.assertLessEqual(first[1], 100.0)
+        second = load.sample()
+        self.assertGreaterEqual(second[1], 0.0)
 
 
 class ClassifyTests(unittest.TestCase):
@@ -518,6 +540,47 @@ class LedgerTests(unittest.TestCase):
             self.assertIn("empty", notice)
             self.assertEqual(loaded.productive_seconds, 0.0)
 
+    def test_day_history_ignores_carried_spend_totals(self) -> None:
+        rows = _segments_from_day(
+            {
+                "date": "2026-11-22",
+                "productive_seconds": 0.0,
+                "spent_seconds": 16961.508,
+                "closed": [
+                    {
+                        "start": "2026-11-22T00:00:00",
+                        "end": "2026-11-23T00:00:00",
+                        "kind": "shutdown",
+                        "process": "Windows",
+                        "title": "Shut down",
+                        "seconds": 86400.0,
+                    }
+                ],
+            }
+        )
+        earlier_spend = [item for item in rows if item.get("kind") == "spend" and item.get("process") == "Earlier"]
+        self.assertEqual(earlier_spend, [])
+
+    def test_day_history_ignores_cumulative_spend_with_partial_segments(self) -> None:
+        rows = _segments_from_day(
+            {
+                "date": "2026-11-10",
+                "productive_seconds": 0.0,
+                "spent_seconds": 7947.225,
+                "closed": [
+                    {
+                        "start": "2026-11-10T12:00:00",
+                        "end": "2026-11-10T12:43:29",
+                        "kind": "spend",
+                        "process": "steam.exe",
+                        "seconds": 2609.234,
+                    }
+                ],
+            }
+        )
+        earlier_spend = [item for item in rows if item.get("kind") == "spend" and item.get("process") == "Earlier"]
+        self.assertEqual(earlier_spend, [])
+
     def test_load_archives_a_previous_day(self) -> None:
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -690,6 +753,145 @@ class ConfigMergeTests(unittest.TestCase):
 
 
 class ChartTests(unittest.TestCase):
+    def test_set_segments_refreshes_each_wall_clock_second(self) -> None:
+        start = datetime(2026, 11, 24, 9, 0, 0)
+        segments = [
+            {
+                "start": start.isoformat(timespec="seconds"),
+                "end": None,
+                "kind": "earn",
+                "seconds": 10.0,
+            }
+        ]
+        chart = object.__new__(CumulativeChart)
+        chart.points = []
+        chart.balance_points = []
+        chart.pause_bands = []
+        chart.mode = "cumulative"
+        chart.user_zoomed = False
+        chart.view_start = 0.0
+        chart.view_end = 1.0
+        chart._drawn_key = None
+        chart._structure_key = None
+        chart._tip_key = None
+        chart._painted_mode = "cumulative"
+        chart._cumulative_cache = None
+        chart._balance_cache = None
+        chart._pause_cache = None
+        chart._draw = lambda: None
+        chart._refresh_live = lambda: None
+        chart._frame = None
+        chart._redraw_hover = lambda: None
+        chart._limits = lambda: (start.timestamp(), start.timestamp() + 3600)
+        first = start + timedelta(seconds=5)
+        second = start + timedelta(seconds=6)
+        chart.set_segments(segments, first)
+        tip = chart._tip_key
+        chart.set_segments(segments, first)
+        self.assertEqual(chart._tip_key, tip)
+        chart.set_segments(segments, second)
+        self.assertNotEqual(chart._tip_key, tip)
+        self.assertAlmostEqual(chart._wall_now, second.timestamp())
+
+    def test_zoom_does_not_force_a_full_segment_rebuild(self) -> None:
+        start = datetime(2026, 11, 24, 9, 0, 0)
+        segments = [
+            {
+                "start": start.isoformat(timespec="seconds"),
+                "end": None,
+                "kind": "earn",
+                "seconds": 10.0,
+            }
+        ]
+        chart = object.__new__(CumulativeChart)
+        chart.points = []
+        chart.balance_points = []
+        chart.pause_bands = []
+        chart.mode = "cumulative"
+        chart.user_zoomed = False
+        chart.view_start = 0.0
+        chart.view_end = 1.0
+        chart._drawn_key = None
+        chart._structure_key = None
+        chart._tip_key = None
+        chart._painted_mode = "cumulative"
+        chart._cumulative_cache = None
+        chart._balance_cache = None
+        chart._pause_cache = None
+        rebuilt = {"count": 0}
+        chart._draw = lambda: None
+        chart._refresh_live = lambda: None
+        chart._frame = (0, 0, 100, 100, 0.0, 60.0)
+        chart._redraw_hover = lambda: None
+        chart._limits = lambda: (start.timestamp(), start.timestamp() + 3600)
+        original_apply = CumulativeChart._apply_live_tip
+
+        def track_live(self, *args, **kwargs):
+            rebuilt["count"] += 1
+            return original_apply(self, *args, **kwargs)
+
+        chart._apply_live_tip = lambda *args, **kwargs: track_live(chart, *args, **kwargs)
+        now = start + timedelta(seconds=5)
+        chart.set_segments(segments, now)
+        structure = chart._structure_key
+        chart.user_zoomed = True
+        chart.view_start = start.timestamp() + 100
+        chart.set_segments(segments, now + timedelta(seconds=1))
+        self.assertEqual(chart._structure_key, structure)
+        self.assertEqual(rebuilt["count"], 1)
+
+    def test_untangle_splits_a_nested_pause_quickly(self) -> None:
+        from gordian.ledger import untangle_segments
+        import time
+
+        outer_start = datetime(2026, 11, 24, 9, 0, 0)
+        inner_start = datetime(2026, 11, 24, 9, 10, 0)
+        inner_end = datetime(2026, 11, 24, 9, 11, 0)
+        outer_end = datetime(2026, 11, 24, 10, 0, 0)
+        nested = [
+            {
+                "start": outer_start.isoformat(timespec="seconds"),
+                "end": outer_end.isoformat(timespec="seconds"),
+                "kind": "paused",
+                "seconds": 3600.0,
+            },
+            {
+                "start": inner_start.isoformat(timespec="seconds"),
+                "end": inner_end.isoformat(timespec="seconds"),
+                "kind": "earn",
+                "seconds": 60.0,
+            },
+        ]
+        split = untangle_segments(nested)
+        kinds = [item["kind"] for item in split]
+        self.assertEqual(kinds.count("earn"), 1)
+        self.assertGreaterEqual(kinds.count("paused"), 2)
+
+        rows = []
+        cursor = datetime(2026, 11, 1, 8, 0, 0)
+        for index in range(2500):
+            end = cursor + timedelta(minutes=2)
+            rows.append(
+                {
+                    "start": cursor.isoformat(timespec="seconds"),
+                    "end": end.isoformat(timespec="seconds"),
+                    "kind": "earn" if index % 2 == 0 else "spend",
+                    "seconds": 120.0,
+                }
+            )
+            cursor = end
+        began = time.perf_counter()
+        untangle_segments(rows)
+        self.assertLess(time.perf_counter() - began, 0.5)
+
+    def test_data_bounds_stops_at_the_system_clock(self) -> None:
+        start = datetime(2026, 11, 8, 12, 0, 0).timestamp()
+        end = datetime(2026, 11, 23, 20, 30, 0).timestamp()
+        now = datetime(2026, 11, 23, 20, 30, 0).timestamp()
+        _view_start, view_end = data_bounds([(start, 0, 0, 0, 0), (end, 0, 0, 0, 0)], now)
+        self.assertLessEqual(view_end, now + 60.0)
+        self.assertGreater(view_end, now)
+
     def test_padding_before_midnight_does_not_count_as_the_previous_day(self) -> None:
         midnight = datetime(2026, 10, 30).timestamp()
         points = [(midnight, 0, 0, 0, 0), (midnight + 360, 0, 12, 300, 0)]
@@ -732,6 +934,33 @@ class ChartTests(unittest.TestCase):
             ]
         )
         self.assertEqual([item[2] for item in spans], ["sleep", "shutdown"])
+
+    def test_balance_points_track_free_time_across_days(self) -> None:
+        day1 = datetime(2026, 11, 10, 22, 0, 0)
+        day2 = datetime(2026, 11, 11, 1, 0, 0)
+        segments = [
+            _segment(day1, day1 + timedelta(hours=1), "earn", 3600),
+            _segment(day1 + timedelta(hours=1), day1 + timedelta(hours=2), "spend", 3600),
+            _segment(day2, day2 + timedelta(hours=1), "earn", 1800),
+            _segment(day2 + timedelta(hours=1), day2 + timedelta(hours=2), "spend", 900),
+            _segment(day2 + timedelta(hours=2), day2 + timedelta(hours=3), "paused", 600),
+        ]
+        # 25:10 → 0.4 reward per work second:
+        # earn 3600→+1440, spend 3600→-2160, earn 1800→-1440, spend 900→-2340, pause flat.
+        points = balance_points(segments, day2 + timedelta(hours=3), 25.0, 10.0)
+        self.assertAlmostEqual(points[-1][1], -2340.0)
+        self.assertEqual(points[-1][2], "paused")
+        pause_start = day2 + timedelta(hours=2)
+        before_pause = next(item for item in points if item[0] == pause_start)
+        self.assertAlmostEqual(before_pause[1], -2340.0)
+        self.assertAlmostEqual(points[-1][1], before_pause[1])
+        spans = pause_spans(segments, day2 + timedelta(hours=3))
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0][0], pause_start)
+        self.assertEqual(blend_hex("#a40000", "#3dd68c", 0.0), "#a40000")
+        self.assertEqual(blend_hex("#a40000", "#3dd68c", 1.0), "#3dd68c")
+        self.assertEqual(balance_color(0, "#a40000", "#3dd68c", 600), "#a40000")
+        self.assertEqual(balance_color(600, "#a40000", "#3dd68c", 600), "#3dd68c")
 
     def test_application_totals_add_up_time_on_each_program(self) -> None:
         rows = application_totals(
@@ -981,7 +1210,8 @@ class RatioAndColorTests(unittest.TestCase):
         self.assertIn("Cursor and Visual Studio Code share that minute", text)
         self.assertIn("asks whether to end the pause", text)
         self.assertIn("Hide legend puts the line names away", text)
-        self.assertIn("Map is the second plot", text)
+        self.assertIn("Tracker", text)
+        self.assertIn("Map sits in the same place", text)
         self.assertIn("Unproductive YouTube videos share one square, YT", text)
         import math
 
@@ -1422,6 +1652,8 @@ class RatioAndColorTests(unittest.TestCase):
     def test_long_spans_label_by_day(self) -> None:
         now = datetime(2026, 10, 26, 20, 0)
         self.assertEqual(axis_label(now.timestamp(), 10 * 86400), now.strftime("%b %d"))
+        self.assertEqual(hover_time_label(now.timestamp(), 10 * 86400), now.strftime("%b %d %H:%M"))
+        self.assertEqual(hover_time_label(now.timestamp(), 3600), now.strftime("%H:%M"))
         self.assertGreaterEqual(_tick_step(90 * 86400), 7 * 86400)
 
     def test_y_axis_uses_a_finer_step_and_a_day_range_splits_the_bars(self) -> None:

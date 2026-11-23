@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from bisect import bisect_left, bisect_right
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -387,18 +388,24 @@ class Ledger:
         self.current = None
 
     def _archive_day(self) -> None:
-        if not (self.productive_seconds or self.spent_seconds or self.closed):
+        day_earn, day_spend = _kind_totals(self.closed)
+        if not (self.productive_seconds or day_spend or self.closed):
             return
+        productive = round(day_earn if day_earn > 0 else self.productive_seconds, 3)
+        spent = round(day_spend, 3)
         summary = {
             "date": self.date,
-            "productive_seconds": round(self.productive_seconds, 3),
-            "spent_seconds": round(self.spent_seconds, 3),
+            "productive_seconds": productive,
+            "spent_seconds": spent,
             "earned_seconds": round(self.earned_seconds, 3),
         }
         _append_history(self.history_path, summary)
         day_path = self.history_path.parent / "days" / f"{self.date}.json"
         if not day_path.exists():
-            atomic_write(day_path, json.dumps(self._payload(), indent=2) + "\n")
+            payload = self._payload()
+            payload["productive_seconds"] = productive
+            payload["spent_seconds"] = spent
+            atomic_write(day_path, json.dumps(payload, indent=2) + "\n")
 
     def _accumulate(self, now: datetime, kind: str, process: str, title: str, delta: float, identity: str) -> bool:
         holding_pause = kind == "paused" and self.current is not None and self.current["kind"] == "paused"
@@ -579,12 +586,33 @@ def read_saved_segments(history_path: Path) -> list[dict]:
     return rows
 
 
+def _kind_totals(segments: list[dict]) -> tuple[float, float]:
+    earn = 0.0
+    spend = 0.0
+    for item in segments:
+        if not isinstance(item, dict):
+            continue
+        seconds = float(item.get("seconds") or 0)
+        kind = item.get("kind")
+        if kind == "earn":
+            earn += seconds
+        elif kind == "spend":
+            spend += seconds
+    return earn, spend
+
+
 def _segments_from_day(data: dict) -> list[dict]:
     closed = [dict(item) for item in (data.get("closed") or []) if isinstance(item, dict) and item.get("start")]
-    earn = sum(float(item.get("seconds") or 0) for item in closed if item.get("kind") == "earn")
-    spend = sum(float(item.get("seconds") or 0) for item in closed if item.get("kind") == "spend")
-    earn_gap = float(data.get("productive_seconds") or 0) - earn
-    spend_gap = float(data.get("spent_seconds") or 0) - spend
+    earn, spend = _kind_totals(closed)
+    stored_earn = float(data.get("productive_seconds") or 0)
+    stored_spend = float(data.get("spent_seconds") or 0)
+    earn_gap = stored_earn - earn
+    spend_gap = stored_spend - spend
+    if spend_gap > 60:
+        if (spend < 1 and stored_spend > 60) or (
+            spend > 0 and stored_spend > spend * 1.25 + 300
+        ):
+            spend_gap = 0
     if earn_gap < 1 and spend_gap < 1:
         return closed
     anchor = _parse_stamp(closed[0].get("start") if closed else None)
@@ -654,8 +682,8 @@ def untangle_segments(segments: list[dict]) -> list[dict]:
     A counted minute can land inside a pause that was already saved. The pause
     keeps the time on either side, and the minute stays where it happened.
 
-    Done in one pass over the list (not one pass per nest), so a long history
-    stays fast enough for the window to stay responsive.
+    Candidates are found with a start-time index (bisect) so thousands of
+    finished days stay cheap — an all-pairs scan freezes the window.
     """
     raw = [dict(item) for item in segments if isinstance(item, dict)]
     count = len(raw)
@@ -663,6 +691,15 @@ def untangle_segments(segments: list[dict]) -> list[dict]:
         return raw
     starts = [_parse_stamp(item.get("start")) for item in raw]
     ends = [_parse_stamp(item.get("end")) for item in raw]
+    order = sorted(
+        (
+            index
+            for index in range(count)
+            if starts[index] is not None and ends[index] is not None and ends[index] > starts[index]
+        ),
+        key=lambda index: (starts[index], ends[index], index),
+    )
+    start_keys = [starts[index] for index in order]
     replaced: set[int] = set()
     pieces: list[dict] = []
     for index, item in enumerate(raw):
@@ -673,15 +710,16 @@ def untangle_segments(segments: list[dict]) -> list[dict]:
         if item.get("kind") in _SKIP_UNTANGLE:
             continue
         span = (end - start).total_seconds()
+        lo = bisect_left(start_keys, start)
+        hi = bisect_right(start_keys, end)
         holes: list[tuple[datetime, datetime]] = []
-        for other in range(count):
+        for pos in range(lo, hi):
+            other = order[pos]
             if other == index:
                 continue
             inner_start = starts[other]
             inner_end = ends[other]
-            if inner_start is None or inner_end is None or inner_end <= inner_start:
-                continue
-            if inner_start < start or inner_end > end:
+            if inner_end > end:
                 continue
             if (inner_end - inner_start).total_seconds() >= span - 0.5:
                 continue

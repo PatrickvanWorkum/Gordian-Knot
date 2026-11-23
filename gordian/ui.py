@@ -33,6 +33,7 @@ from gordian import __version__
 from gordian.chart import AppBars, CumulativeChart, application_totals, covered_range
 from gordian.treemap import UsageMap, balance_areas, group_youtube
 from gordian.classify import Decision, Memory, classify, resolve, segment_identity
+from gordian.clock import local_now
 from gordian.colors import chosen_color, hex_to_rgb, hsv_to_rgb, normalize_hex, rgb_to_hex, rgb_to_hsv
 from gordian.formatting import format_duration, format_ratio, parse_day, parse_ratio, plain_number
 from gordian.ledger import (
@@ -63,6 +64,7 @@ from gordian.monitor import (
     install_logo_menu,
 )
 from gordian.paths import data_dir, log_exception, project_root
+from gordian.resources import ProcessLoad, format_load
 from gordian.startmenu import install_start_menu_soon
 from gordian.settings import (
     Milestone,
@@ -302,12 +304,14 @@ def about_message(work_minutes: float, reward_minutes: float) -> str:
         "YouTube stays unproductive, and a tutorial video can count as work without changing the rest of YouTube. "
         "Closing the window leaves the watcher running in the tray.\n\n"
         "The green line is productive time and the purple line is Steam, YouTube, and games. "
-        "Gold is paused time and grey is time that is not counting. Click a line's name to hide it. "
+        "Time series keeps the full history. Tracker is free time left, coloured from empty to plenty, "
+        "with a yellow tint over paused stretches. "
+        "On Time series, click a line's name to hide it. "
         "Grey bands are sleep and dark red bands are a shut down. Both are saved and the balance stays put through them. "
-        "Setting the clock forward draws a spotted pink band for the missing time. Setting it back draws a solid pink line with the time that was lost. "
+        "Setting the clock forward draws a spotted pink band for the missing time. "
         "Free time carries past midnight. Reset time clears it and draws a solid light blue line. "
         "Scroll to zoom, drag to move, and Fit or a double-click shows the whole day. Reload rereads the saved days. "
-        "Hide legend puts the line names away. Map is the second plot, in the same place as the time series. "
+        "Hide legend puts the line names away. Map sits in the same place as the time series. "
         "It draws work in green and unproductive time in red. The two blocks start the same size. "
         "Work grows linearly with the W:R. The red block is the time spent on unproductive programs. "
         "When free time is below zero, the red block grows as e raised to the W:R times the overspent minutes. "
@@ -385,6 +389,8 @@ class App:
         self._lockdown_until = 0.0
         self._warning_thread = None
         self.running = True
+        self._process_load = ProcessLoad()
+        self._resource_job = None
         self.icon = None
         self.icon_color = None
         self.log_lines = None
@@ -419,6 +425,13 @@ class App:
         self._shown_title = ""
         self._history_segments: list[dict] = []
         self._history_loading = False
+        self._totals_key: tuple | None = None
+        self._totals_rows: list[tuple[str, float]] | None = None
+        self._map_totals_key: tuple | None = None
+        self._map_earn_rows: list[tuple[str, float]] | None = None
+        self._map_spend_rows: list[tuple[str, float]] | None = None
+        self._map_pause_rows: list[tuple[str, float]] | None = None
+        self._feed_key: tuple | None = None
         try:
             self.config_mtime = config_path.stat().st_mtime
         except OSError:
@@ -439,6 +452,7 @@ class App:
         self.root.after(0, self._load_history_soon)
         self.root.after(200, self.tick)
         self.root.after(300, self.show)
+        self.root.after(400, self._update_resources)
         self.root.mainloop()
 
     def _load_history_soon(self) -> None:
@@ -561,6 +575,8 @@ class App:
         self.plot_view = "series"
         self.plot_series = self._button(chart_head, "Time series", lambda: self._show_plot("series"))
         self.plot_series.pack(side="left")
+        self.plot_day = self._button(chart_head, "Tracker", lambda: self._show_plot("day"))
+        self.plot_day.pack(side="left", padx=(6, 0))
         self.plot_map = self._button(chart_head, "Map", lambda: self._show_plot("map"))
         self.plot_map.pack(side="left", padx=(6, 12))
         self.chart_title = tk.Label(
@@ -677,8 +693,15 @@ class App:
         self._set_log([])
         self._style_tabs()
 
-        self.notice = _label(self.root, "", BG, MUTED, 9, wrap=640)
+        self.footer = tk.Frame(self.root, bg=BG)
+        self._bg_widgets.append(self.footer)
+        self.footer.pack(fill="x", padx=16, pady=(4, 10), side="bottom")
+        self.notice = _label(self.footer, "", BG, MUTED, 9, wrap=520)
         self._bg_widgets.append(self.notice)
+        self.notice.pack(side="left", fill="x", expand=True)
+        self.resource_label = _label(self.footer, "CPU: —   RAM: —", BG, MUTED, 9)
+        self._bg_widgets.append(self.resource_label)
+        self.resource_label.pack(side="right", padx=(12, 0))
         self._apply_saved_colors()
         self._apply_saved_fonts()
         if self.night:
@@ -732,7 +755,7 @@ class App:
             )
 
     def _style_plots(self) -> None:
-        for name, button in (("series", self.plot_series), ("map", self.plot_map)):
+        for name, button in (("series", self.plot_series), ("day", self.plot_day), ("map", self.plot_map)):
             active = self.plot_view == name
             button.configure(
                 bg=self._chosen(button, "bg", CARD if active else BG),
@@ -752,10 +775,16 @@ class App:
             self.usage.pack(fill="x", padx=8, pady=(4, 8))
         else:
             self.usage.pack_forget()
+            # Draw once via _refresh_view; set_mode alone would redraw then pack would again.
+            self.chart.set_mode("running" if view == "day" else "cumulative", draw=False)
             self.chart.pack(fill="x", padx=8, pady=(4, 8))
             self.reload_button.pack_forget()
             self.series_tools.pack(side="right")
             self.reload_button.pack(side="right", padx=(0, 8))
+            if view == "day":
+                self.legend_button.pack_forget()
+            else:
+                self.legend_button.pack(side="right", padx=(0, 8))
         self._refresh_view()
 
     def _show_activity(self, view: str) -> None:
@@ -1003,6 +1032,8 @@ class App:
         )
         self.milestone_bonus.pack(side="left", padx=(6, 0), ipady=2)
         self._button(add_row, "Add", self._add_milestone).pack(side="left", padx=(6, 0))
+        self._entry_hint(self.milestone_name, "Describe the task…")
+        self._entry_hint(self.milestone_bonus, "mins")
         stack = tk.Frame(self.milestone_frame, bg=CARD)
         stack.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         stack.rowconfigure(0, weight=1)
@@ -1062,10 +1093,10 @@ class App:
         done_count = 0
         for index, item in enumerate(items):
             if item.done:
-                self._milestone_row(self.done_rows, item, None)
+                self._milestone_row(self.done_rows, item, index, can_complete=False)
                 done_count += 1
             else:
-                self._milestone_row(self.open_rows, item, index)
+                self._milestone_row(self.open_rows, item, index, can_complete=True)
                 open_count += 1
         if open_count == 0:
             self._milestone_empty(self.open_rows, "No tasks yet.")
@@ -1077,7 +1108,33 @@ class App:
         label.pack(fill="x", padx=4, pady=4)
         label.bind("<MouseWheel>", pane._wheel)
 
-    def _milestone_row(self, pane, item: Milestone, index: int | None) -> None:
+    def _entry_hint(self, entry: tk.Entry, hint: str) -> None:
+        entry._hint = hint  # type: ignore[attr-defined]
+
+        def show_hint(_event=None) -> None:
+            if entry.get().strip():
+                return
+            entry.delete(0, "end")
+            entry.insert(0, hint)
+            entry.configure(fg=MUTED)
+
+        def hide_hint(_event=None) -> None:
+            if entry.get() == hint:
+                entry.delete(0, "end")
+                entry.configure(fg=TEXT)
+
+        entry.bind("<FocusIn>", hide_hint, add="+")
+        entry.bind("<FocusOut>", show_hint, add="+")
+        show_hint()
+
+    def _entry_value(self, entry: tk.Entry) -> str:
+        text = entry.get().strip()
+        hint = getattr(entry, "_hint", None)
+        if hint and text == hint:
+            return ""
+        return text
+
+    def _milestone_row(self, pane, item: Milestone, index: int, can_complete: bool) -> None:
         row = tk.Frame(pane, bg=CARD)
         row.pack(fill="x", padx=2, pady=1)
         label = tk.Label(
@@ -1089,7 +1146,8 @@ class App:
             font=(FONT, 9),
         )
         label.pack(side="left", fill="x", expand=True)
-        if index is not None:
+        widgets = [row, label]
+        if can_complete:
             variable = tk.IntVar(value=0)
             tick = tk.Checkbutton(
                 row,
@@ -1101,13 +1159,23 @@ class App:
                 highlightthickness=0,
             )
             tick.pack(side="right")
-        for widget in row.winfo_children():
+            widgets.append(tick)
+        menu = tk.Menu(row, tearoff=0)
+        menu.add_command(label="Delete", command=lambda index=index: self._delete_milestone(index))
+
+        def popup(event, menu=menu) -> None:
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        for widget in widgets:
             widget.bind("<MouseWheel>", pane._wheel)
-        row.bind("<MouseWheel>", pane._wheel)
+            widget.bind("<Button-3>", popup)
 
     def _add_milestone(self) -> None:
-        title = " ".join(self.milestone_name.get().split())
-        raw = self.milestone_bonus.get().strip()
+        title = " ".join(self._entry_value(self.milestone_name).split())
+        raw = self._entry_value(self.milestone_bonus)
         try:
             minutes = float(raw)
         except ValueError:
@@ -1119,7 +1187,29 @@ class App:
         self._store_milestones(items)
         self.milestone_name.delete(0, "end")
         self.milestone_bonus.delete(0, "end")
+        self.milestone_name.event_generate("<FocusOut>")
+        self.milestone_bonus.event_generate("<FocusOut>")
         self._show_note(f"Added {title}. Mark it done to add {plain_number(minutes)} minutes.")
+
+    def _delete_milestone(self, index: int) -> None:
+        items = list(self.settings.milestones)
+        if index < 0 or index >= len(items):
+            return
+        item = items[index]
+        if not self.unlocked:
+            result = self._prompt(
+                "Delete task",
+                f"Remove {item.title} from the list.",
+                [("password", "Password")],
+                secret={"password"},
+            )
+            if result is None or not password_accepted(False, result["password"], self.settings.reset_password):
+                if result is not None:
+                    self._show_note("That password did not match.")
+                return
+        del items[index]
+        self._store_milestones(items)
+        self._show_note(f"Removed {item.title}.")
 
     def _tick_milestone(self, index: int, variable: tk.IntVar) -> None:
         if not variable.get():
@@ -1443,7 +1533,7 @@ class App:
         # Sample, classify, apply the schedule, bank the seconds, then warn or close.
         self._reload_config()
         now_mono = time.monotonic()
-        wall = datetime.now()
+        wall = local_now()
         if self.last_wall is not None:
             wall_gap = (wall - self.last_wall).total_seconds()
             gap_kind = wall_gap_kind(wall_gap, now_mono - self.last_monotonic)
@@ -1509,6 +1599,12 @@ class App:
         forget_saved_segments()
         self._history_segments = []
         self.chart._drawn_key = None
+        self.chart._structure_key = None
+        self.chart._cumulative_cache = None
+        self.chart._balance_cache = None
+        self._totals_key = None
+        self._map_totals_key = None
+        self._feed_key = None
         self._load_history_soon()
         self._show_note("The graph was reloaded.")
 
@@ -1522,8 +1618,19 @@ class App:
 
     def _on_root_map(self, event) -> None:
         if event.widget is self.root:
-            self.root.after_idle(self._refresh_view)
+            self.root.after_idle(self._wake_charts)
             self.root.after_idle(self._paint_title_bar)
+
+    def _wake_charts(self) -> None:
+        """Catch the graphs up when the window is shown; live updates run only while open."""
+        if not self.running:
+            return
+        # Force at least a tip refresh so the lines match the ledger without a disk reread.
+        self.chart._tip_key = None
+        self._totals_key = None
+        self._map_totals_key = None
+        self._feed_key = None
+        self._refresh_view()
 
     def _save_quietly(self) -> None:
         try:
@@ -1937,7 +2044,7 @@ class App:
     def _render_view(self, decision, shown: str, color: str, snap: dict, sample=None) -> None:
         # Only runs while the window is on screen; _on_root_map repaints when it comes back.
         kind = decision.kind
-        now = datetime.now()
+        now = local_now()
         _update(self.date_label, text=f"{now.strftime('%A, %B')} {now.day}")
         _update(self.accent, bg=self._chosen(self.accent, "bg", color))
         _update(
@@ -1983,27 +2090,67 @@ class App:
         _update(self.ratio_chip, text=self._ratio_caption())
         _update(self.pause_button, text="Resume" if self.paused else "Pause")
         segments = list(self._history_segments) + list(snap.get("segments") or [])
+        last = segments[-1] if segments else {}
+        live = float(last.get("seconds") or 0)
+        structure_tip = (
+            len(segments),
+            last.get("kind"),
+            last.get("start"),
+            last.get("end"),
+            int(live),
+            self.span_window,
+        )
         if self.activity_view == "feed":
-            logged = [item for item in segments if item.get("end")]
-            self._set_log([format_segment(item, now.date()) for item in reversed(logged)])
+            # Ignore live seconds — the open stretch is not listed until it closes.
+            feed_key = (
+                len(segments),
+                last.get("kind"),
+                last.get("start"),
+                last.get("end"),
+                self.span_window,
+            )
+            if feed_key != self._feed_key:
+                logged = [item for item in segments if item.get("end")]
+                self._set_log([format_segment(item, now.date()) for item in reversed(logged)])
+                self._feed_key = feed_key
         if self.activity_view == "apps":
-            if self.span_window:
-                self.app_bars.set_rows(application_totals(segments, self.span_window[0], self.span_window[1]))
-            else:
-                self.app_bars.set_rows(application_totals(segments))
+            if structure_tip != self._totals_key or self._totals_rows is None:
+                if self.span_window:
+                    self._totals_rows = application_totals(
+                        segments, self.span_window[0], self.span_window[1]
+                    )
+                else:
+                    self._totals_rows = application_totals(segments)
+                self._totals_key = structure_tip
+            self.app_bars.set_rows(self._totals_rows)
         if self.plot_view == "map":
-            window = self.span_window
-            earn = [item for item in segments if item.get("kind") == "earn" and item.get("process") != "Earlier"]
-            spend = [item for item in segments if item.get("kind") == "spend" and item.get("process") != "Earlier"]
-            paused = [item for item in segments if item.get("kind") == "paused"]
-            if window:
-                earn_rows = application_totals(earn, window[0], window[1])
-                spend_rows = group_youtube(application_totals(spend, window[0], window[1]))
-                pause_rows = application_totals(paused, window[0], window[1])
-            else:
-                earn_rows = application_totals(earn)
-                spend_rows = group_youtube(application_totals(spend))
-                pause_rows = application_totals(paused)
+            if structure_tip != self._map_totals_key or self._map_earn_rows is None:
+                window = self.span_window
+                earn = [
+                    item
+                    for item in segments
+                    if item.get("kind") == "earn" and item.get("process") != "Earlier"
+                ]
+                spend = [
+                    item
+                    for item in segments
+                    if item.get("kind") == "spend" and item.get("process") != "Earlier"
+                ]
+                paused = [item for item in segments if item.get("kind") == "paused"]
+                if window:
+                    self._map_earn_rows = application_totals(earn, window[0], window[1])
+                    self._map_spend_rows = group_youtube(
+                        application_totals(spend, window[0], window[1])
+                    )
+                    self._map_pause_rows = application_totals(paused, window[0], window[1])
+                else:
+                    self._map_earn_rows = application_totals(earn)
+                    self._map_spend_rows = group_youtube(application_totals(spend))
+                    self._map_pause_rows = application_totals(paused)
+                self._map_totals_key = structure_tip
+            earn_rows = self._map_earn_rows
+            spend_rows = self._map_spend_rows
+            pause_rows = self._map_pause_rows or []
             green, red = balance_areas(
                 sum(value for _name, value in earn_rows),
                 sum(value for _name, value in spend_rows),
@@ -2015,7 +2162,14 @@ class App:
             if pause_seconds > 0:
                 spend_rows = list(spend_rows) + [("Paused", pause_seconds)]
             self.usage.set_picture(earn_rows, spend_rows, green, red)
-        self.chart.set_segments(segments, now)
+        self.chart.set_segments(
+            segments,
+            now,
+            work_minutes=self.ledger.work_minutes,
+            reward_minutes=self.ledger.reward_minutes,
+            remaining_seconds=snap["remaining_seconds"],
+            draw=self.plot_view in {"series", "day"},
+        )
         _update(self.chart_title, text=self._chart_caption())
         note = self.notice_text or self.user_note
         if self.debug_mode:
@@ -3422,15 +3576,29 @@ class App:
 
     def _set_notice(self, text: str, fg: str) -> None:
         try:
-            if not text:
-                if self.notice.winfo_ismapped():
-                    self.notice.pack_forget()
-                return
-            _update(self.notice, text=text, fg=self._chosen(self.notice, "fg", fg))
-            if not self.notice.winfo_ismapped():
-                self.notice.pack(fill="x", padx=16, pady=(4, 10))
+            _update(self.notice, text=text or "", fg=self._chosen(self.notice, "fg", fg))
         except tk.TclError:
             return
+
+    def _update_resources(self) -> None:
+        self._resource_job = None
+        if not self.running:
+            return
+        try:
+            if self._view_visible():
+                cpu, ram = self._process_load.sample()
+                _update(
+                    self.resource_label,
+                    text=format_load(cpu, ram),
+                    fg=self._chosen(self.resource_label, "fg", MUTED),
+                )
+        except Exception:
+            log_exception("resources")
+        if self.running:
+            try:
+                self._resource_job = self.root.after(1000, self._update_resources)
+            except tk.TclError:
+                return
 
     def show_about(self, *_args) -> None:
         try:
@@ -3609,6 +3777,11 @@ class App:
 
     def _toggle_debug(self) -> None:
         self.debug_mode = not self.debug_mode
+        self.chart.detail_hover = self.debug_mode
+        self.chart._hover_drawn_x = None
+        if self.chart._frame is not None:
+            self.chart.delete("hover")
+            self.chart._draw_hover(*self.chart._frame)
         if self.debug_mode:
             self._set_notice(
                 "Colors are on. Click text to change its color and font. Choose Colors again to leave.",
@@ -3718,6 +3891,9 @@ class App:
             "clock": self.chart.clock_color,
             "lost": self.chart.lost_color,
             "reset": self.chart.reset_color,
+            "free_empty": self.chart.free_empty,
+            "free_full": self.chart.free_full,
+            "pause_tint": self.chart.pause_tint,
             "text": self.chart.text_color,
             "muted": self.chart.muted_color,
             "grid": self.chart.grid_color,
@@ -4121,6 +4297,8 @@ class App:
         self.root.attributes("-topmost", True)
         self.root.after(250, self._clear_topmost)
         self.root.focus_force()
+        # Map may not fire when already "normal"; still bring charts up to date.
+        self.root.after_idle(self._wake_charts)
 
     def _clear_topmost(self) -> None:
         if self.running:
