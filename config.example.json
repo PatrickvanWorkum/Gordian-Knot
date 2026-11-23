@@ -1,0 +1,70 @@
+{
+  "_comment": "Copy this file to config.json, or just launch the app once and it will create config.json with these defaults. Edit lists in the app when you can; hand-edit only if you need to. * in a process name is a wildcard. work_minutes of work earns reward_minutes of free time.",
+  "idle_seconds": 60,
+  "work_minutes": 25,
+  "reward_minutes": 10,
+  "poll_seconds": 1,
+  "productive_processes": [
+    "cursor.exe",
+    "code.exe",
+    "devenv.exe",
+    "godot*",
+    "unity.exe",
+    "blender.exe",
+    "rider64.exe",
+    "rider.exe",
+    "aseprite.exe",
+    "unrealeditor*"
+  ],
+  "reward_processes": [
+    "steam.exe",
+    "steamwebhelper.exe"
+  ],
+  "reward_title_keywords": [
+    "youtube"
+  ],
+  "productive_title_keywords": [],
+  "browser_processes": [
+    "firefox.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "waterfox.exe",
+    "librewolf.exe"
+  ],
+  "game_path_markers": [
+    "\\steamapps\\common\\",
+    "\\epic games\\",
+    "\\gog galaxy\\",
+    "\\gog games\\",
+    "\\paradox interactive\\",
+    "\\riot games\\",
+    "\\xboxgames\\",
+    "\\battlenet\\",
+    "\\ea games\\",
+    "\\origin games\\"
+  ],
+  "ignored_processes": [
+    "explorer.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "applicationframehost.exe",
+    "systemsettings.exe",
+    "textinputhost.exe",
+    "lockapp.exe",
+    "logonui.exe",
+    "python.exe",
+    "pythonw.exe",
+    "dwm.exe",
+    "sihost.exe",
+    "startmenuexperiencehost.exe",
+    "widgetboard.exe",
+    "gamebar.exe",
+    "gamebarftserver.exe"
+  ],
+  "reset_password": "0000",
+  "schedule": [],
+  "milestones": []
+}

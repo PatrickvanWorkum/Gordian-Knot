@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.tmp
+.pytest_cache/
+
+# Personal settings. The app writes a fresh default on first launch.
+# Ship config.example.json; never commit a real config.json.
+config.json
+state*.json
+*.log
+.vscode/
+.idea/
+.cursor/
+*.code-workspace
